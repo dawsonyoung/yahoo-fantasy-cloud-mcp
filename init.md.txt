@@ -1,0 +1,397 @@
+# Project: Serverless FastMCP Yahoo Fantasy Server for Gemini
+
+This specification details the full directory structure, source code, configuration, container definitions, and CI/CD pipelines for a scale-to-zero FastMCP server deployed to Google Cloud Run with Google Secret Manager OAuth2 persistence.
+
+---
+
+## 1. Directory Structure
+
+```text
+yahoo-fantasy-gemini-mcp/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+├── src/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── yahoo/
+│   │   ├── __init__.py
+│   │   ├── auth.py
+│   │   └── client.py
+│   └── mcp_server.py
+├── tests/
+│   ├── __init__.py
+│   └── test_server.py
+├── .env.example
+├── .gitignore
+├── deploy.sh
+├── Dockerfile
+├── pyproject.toml
+└── README.md
+```
+
+---
+
+## 2. Project Configuration & Dependencies
+
+### `pyproject.toml`
+```toml
+[project]
+name = "yahoo-fantasy-gemini-mcp"
+version = "0.1.0"
+description = "Serverless FastMCP Yahoo Fantasy Server with Google Secret Manager token persistence."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=0.1.0",
+    "yahoo-fantasy-api>=2.0.0",
+    "yahoo-oauth>=0.6.0",
+    "google-cloud-secret-manager>=2.16.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.12.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+```
+
+### `.gitignore`
+```text
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.env
+oauth2.json
+*.db
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+```
+
+### `.env.example`
+```env
+YAHOO_CLIENT_ID="your_yahoo_client_id"
+YAHOO_CLIENT_SECRET="your_yahoo_client_secret"
+YAHOO_LEAGUE_ID="nfl.l.123456"
+GCP_PROJECT_ID="your-gcp-project-id"
+YAHOO_SECRET_NAME="YAHOO_OAUTH_TOKEN"
+PORT=8080
+```
+
+---
+
+## 3. Source Code Implementation
+
+### `src/config.py`
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    yahoo_client_id: str
+    yahoo_client_secret: str
+    yahoo_league_id: str
+    gcp_project_id: str | None = None
+    yahoo_secret_name: str = "YAHOO_OAUTH_TOKEN"
+    port: int = 8080
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+settings = Settings()
+```
+
+### `src/yahoo/auth.py`
+```python
+import json
+import os
+from google.cloud import secretmanager
+from yahoo_oauth import OAuth2
+from src.config import settings
+
+
+def get_authenticated_session() -> OAuth2:
+    """Retrieves an authenticated OAuth2 session, persisting tokens via Secret Manager in GCP
+
+    or local oauth2.json during local development.
+    """
+    # 1. Local development fallback
+    if os.path.exists("oauth2.json"):
+        sc = OAuth2(None, None, from_file="oauth2.json")
+        if not sc.token_is_valid():
+            sc.refresh_access_token()
+        return sc
+
+    # 2. Cloud Run / Secret Manager flow
+    if settings.gcp_project_id:
+        client = secretmanager.SecretManagerServiceClient()
+        secret_path = (
+            f"projects/{settings.gcp_project_id}/secrets/{settings.yahoo_secret_name}/versions/latest"
+        )
+        response = client.access_secret_version(request={"name": secret_path})
+        token_data = json.loads(response.payload.data.decode("UTF-8"))
+
+        # Write temporarily to memory/disk for yahoo_oauth consumption
+        with open("/tmp/oauth2.json", "w") as f:
+            json.dump(token_data, f)
+
+        sc = OAuth2(None, None, from_file="/tmp/oauth2.json")
+
+        if not sc.token_is_valid():
+            sc.refresh_access_token()
+            # Persist the refreshed token back to Secret Manager
+            with open("/tmp/oauth2.json", "r") as f:
+                updated_token_data = f.read()
+
+            parent = f"projects/{settings.gcp_project_id}/secrets/{settings.yahoo_secret_name}"
+            client.add_secret_version(
+                request={
+                    "parent": parent,
+                    "payload": {"data": updated_token_data.encode("UTF-8")},
+                }
+            )
+
+        return sc
+
+    raise RuntimeError(
+        "No valid authentication source found. Provide oauth2.json or set GCP_PROJECT_ID."
+    )
+```
+
+### `src/yahoo/client.py`
+```python
+from typing import Any
+import yahoo_fantasy_api as yfa
+from src.config import settings
+from src.yahoo.auth import get_authenticated_session
+
+
+class YahooFantasyClient:
+    def __init__(self):
+        self._sc = None
+        self._league = None
+
+    @property
+    def league(self) -> yfa.League:
+        if self._league is None:
+            self._sc = get_authenticated_session()
+            gm = yfa.Game(self._sc, "nfl")
+            self._league = gm.to_league(settings.yahoo_league_id)
+        return self._league
+
+    def get_roster(self, team_key: str) -> list[dict[str, Any]]:
+        """Fetch current roster and status for a team."""
+        team = self.league.to_team(team_key)
+        return team.roster()
+
+    def get_free_agents(self, position: str, count: int = 10) -> list[dict[str, Any]]:
+        """Fetch top available free agents by position (e.g., 'RB', 'WR', 'TE')."""
+        return self.league.free_agents(position)[:count]
+
+    def get_matchups(self) -> list[dict[str, Any]]:
+        """Fetch weekly matchups and projected scores."""
+        return self.league.matchups()
+
+    def get_standings(self) -> list[dict[str, Any]]:
+        """Fetch current league standings and records."""
+        return self.league.standings()
+```
+
+### `src/mcp_server.py`
+```python
+from typing import Any
+from fastmcp import FastMCP
+from src.config import settings
+from src.yahoo.client import YahooFantasyClient
+
+mcp = FastMCP("Yahoo Fantasy Football MCP")
+client = YahooFantasyClient()
+
+
+@mcp.tool()
+def get_team_roster(team_key: str) -> list[dict[str, Any]]:
+    """Fetch current roster, starting slots, and injury status for a Yahoo Fantasy team."""
+    return client.get_roster(team_key)
+
+
+@mcp.tool()
+def get_top_waiver_players(position: str, count: int = 10) -> list[dict[str, Any]]:
+    """Fetch top available free agents on the waiver wire for a position (e.g. 'RB', 'WR', 'TE')."""
+    return client.get_free_agents(position=position, count=count)
+
+
+@mcp.tool()
+def get_league_matchups() -> list[dict[str, Any]]:
+    """Fetch weekly fantasy matchups, live scores, and projected point totals."""
+    return client.get_matchups()
+
+
+@mcp.tool()
+def get_league_standings() -> list[dict[str, Any]]:
+    """Fetch overall league standings, records, and points for/against."""
+    return client.get_standings()
+
+
+if __name__ == "__main__":
+    # Expose SSE transport for scale-to-zero Cloud Run HTTP invocations
+    mcp.run(transport="sse", host="0.0.0.0", port=settings.port)
+```
+
+---
+
+## 4. Container & Deployment
+
+### `Dockerfile`
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir uv
+
+COPY pyproject.toml .
+RUN uv pip install --system .
+
+COPY src/ ./src/
+
+EXPOSE 8080
+CMD ["python", "-m", "src.mcp_server"]
+```
+
+### `deploy.sh`
+```bash
+#!/bin/bash
+set -e
+
+SERVICE_NAME="yahoo-fantasy-mcp"
+REGION="us-east1"
+
+echo "Deploying ${SERVICE_NAME} to Google Cloud Run (scale-to-zero)..."
+
+gcloud run deploy ${SERVICE_NAME} \
+  --source . \
+  --platform managed \
+  --region ${REGION} \
+  --min-instances 0 \
+  --max-instances 1 \
+  --allow-unauthenticated \
+  --set-env-vars YAHOO_SECRET_NAME="YAHOO_OAUTH_TOKEN"
+
+echo "Deployment complete! Copy the SSE endpoint URL provided above into your Gemini / Agent settings."
+```
+
+---
+
+## 5. Automated Tests & CI/CD
+
+### `tests/test_server.py`
+```python
+from unittest.mock import MagicMock, patch
+from src.yahoo.client import YahooFantasyClient
+
+
+@patch("src.yahoo.client.get_authenticated_session")
+@patch("yahoo_fantasy_api.Game")
+def test_get_roster(mock_game, mock_auth):
+    mock_league = MagicMock()
+    mock_team = MagicMock()
+    mock_team.roster.return_value = [
+        {"name": "Christian McCaffrey", "position_type": "RB", "status": "Healthy"}
+    ]
+    mock_league.to_team.return_value = mock_team
+    mock_game.return_value.to_league.return_value = mock_league
+
+    client = YahooFantasyClient()
+    roster = client.get_roster("team_1")
+
+    assert len(roster) == 1
+    assert roster[0]["name"] == "Christian McCaffrey"
+    assert roster[0]["status"] == "Healthy"
+
+
+@patch("src.yahoo.client.get_authenticated_session")
+@patch("yahoo_fantasy_api.Game")
+def test_get_free_agents(mock_game, mock_auth):
+    mock_league = MagicMock()
+    mock_league.free_agents.return_value = [
+        {"name": "Player A", "position": "WR"},
+        {"name": "Player B", "position": "WR"},
+    ]
+    mock_game.return_value.to_league.return_value = mock_league
+
+    client = YahooFantasyClient()
+    waivers = client.get_free_agents("WR", count=2)
+
+    assert len(waivers) == 2
+    assert waivers[0]["name"] == "Player A"
+```
+
+### `.github/workflows/ci.yml`
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv & Dependencies
+        run: |
+          curl -LsSf [https://astral.sh/uv/install.sh](https://astral.sh/uv/install.sh) | sh
+          uv pip install --system ".[dev]"
+
+      - name: Lint with Ruff
+        run: ruff check .
+
+      - name: Run Pytest Suite
+        run: pytest tests/
+```
+
+---
+
+## 6. Antigravity Agent Execution Instructions
+
+To execute this build in Antigravity:
+1. Create all files according to the structure above.
+2. Run `ruff check .` and `pytest tests/` in the terminal tool.
+3. Initialize Git: `git init -b main`.
+4. Commit: `git add . && git commit -m "feat: serverless fastmcp yahoo fantasy server for cloud run"`.
+5. Push to GitHub: `gh repo create yahoo-fantasy-gemini-mcp --public --source=. --remote=origin --push`.
